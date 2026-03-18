@@ -39,7 +39,6 @@ Then, in your Harper applications `config.yaml` paste the plugin:
   package: '@harperfast/vite-plugin'
 ```
 
-
 Next, open `package.json` and change the "dev" script to:
 
 ```

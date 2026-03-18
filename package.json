@@ -1,6 +1,6 @@
 {
 	"name": "@harperfast/vite-plugin",
-	"version": "0.0.1",
+	"version": "0.1.0",
 	"description": "Plugin for running Vite applications inside Harper",
 	"license": "Apache-2.0",
 	"type": "module",
@@ -24,14 +24,13 @@
 		"build": "tsc",
 		"dev": "tsc --watch",
 		"test:coverage": "npm run build && node --test --experimental-test-coverage",
-		"lint": "eslint . --ignore-pattern 'dist/**'",
 		"format": "prettier .",
 		"format:check": "npm run format -- --check",
 		"format:write": "npm run format -- --write",
 		"prepublishOnly": "npm run build"
 	},
-	"dependencies": {
-		"vite": "^7.2.7"
+	"peerDependencies": {
+		"vite": ">= 7"
 	},
 	"exports": {
 		".": "./dist/index.js",
@@ -57,9 +56,9 @@
 	},
 	"devDependencies": {
 		"@harperdb/code-guidelines": "^0.0.6",
-		"@types/node": "^25.0.2",
-		"eslint": "^9.39.2",
-		"prettier": "^3.7.4",
-		"typescript": "^5.9.3"
+		"@types/node": "^24.12.0",
+		"prettier": "^3.8.1",
+		"typescript": "^5.9.3",
+		"vite": "^8.0.0"
 	}
 }
