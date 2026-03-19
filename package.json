@@ -4,9 +4,10 @@
 	"description": "Plugin for running Vite applications inside Harper",
 	"license": "Apache-2.0",
 	"type": "module",
-	"main": "src/index.ts",
 	"files": [
-		"dist/",
+		"dist/index.js",
+		"dist/index.d.ts",
+		"dist/index.js.map",
 		"config.yaml",
 		"LICENSE",
 		"README.md"
@@ -23,7 +24,9 @@
 	"scripts": {
 		"build": "tsc",
 		"dev": "tsc --watch",
-		"test:coverage": "npm run build && node --test --experimental-test-coverage",
+		"harper:dev": "harper dev .",
+		"test": "node --test dist/*.test.js",
+		"test:coverage": "npm run build && node --test --experimental-test-coverage dist/*.test.js",
 		"format": "prettier .",
 		"format:check": "npm run format -- --check",
 		"format:write": "npm run format -- --write",
@@ -31,10 +34,6 @@
 	},
 	"peerDependencies": {
 		"vite": ">= 7"
-	},
-	"exports": {
-		".": "./dist/index.js",
-		"./config": "./config.yaml"
 	},
 	"repository": {
 		"type": "git",
@@ -55,9 +54,19 @@
 		}
 	},
 	"devDependencies": {
+		"@commitlint/cli": "^20.0.0",
+		"@commitlint/config-conventional": "^20.0.0",
 		"@harperdb/code-guidelines": "^0.0.6",
+		"@semantic-release/commit-analyzer": "^13.0.1",
+		"@semantic-release/git": "^10.0.1",
+		"@semantic-release/github": "^12.0.2",
+		"@semantic-release/npm": "^13.1.1",
+		"@semantic-release/release-notes-generator": "^14.1.0",
 		"@types/node": "^24.12.0",
+		"conventional-changelog-conventionalcommits": "^9.1.0",
+		"harperdb": "^4.7.24",
 		"prettier": "^3.8.1",
+		"semantic-release": "^25.0.2",
 		"typescript": "^5.9.3",
 		"vite": "^8.0.0"
 	}

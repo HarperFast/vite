@@ -12,8 +12,13 @@
 		"strict": true,
 		"noUnusedLocals": true,
 		"noUnusedParameters": true,
-		"forceConsistentCasingInFileNames": true
+		"forceConsistentCasingInFileNames": true,
+		"skipLibCheck": true
 	},
 	"include": ["src/**/*"],
-	"exclude": ["node_modules", "dist", "test"]
+	"exclude": ["node_modules", "dist", "test"],
+	"ts-node": {
+		"esm": true,
+		"experimentalSpecifierResolution": "node"
+	}
 }
