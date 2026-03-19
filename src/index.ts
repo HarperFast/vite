@@ -14,4 +14,6 @@ export async function handleApplication(scope: Scope) {
 	scope.server.http(async (request) => {
 		return await viteInstance.middlewares(request._nodeRequest, request._nodeResponse);
 	});
+
+	scope.on('close', () => viteInstance.close());
 }
