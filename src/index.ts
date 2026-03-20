@@ -1,6 +1,7 @@
 import type { Scope } from 'harperdb';
 import { join } from 'node:path';
 import * as vite from 'vite';
+import { parentPort } from 'node:worker_threads';
 
 export const viteWrapper = {
 	createServer: vite.createServer,
@@ -20,4 +21,12 @@ export async function handleApplication(scope: Scope) {
 	}
 
 	scope.on('close', () => viteInstance.close());
+
+	// TODO: Once `scope.close` is emitting properly, we won't need this. Hopefully.
+	//       To you who read this in 2 years and shake your head: I salute you, sir or madam.
+	parentPort?.on('message', (msg) => {
+		if (msg.type === 'shutdown') {
+			viteInstance.close();
+		}
+	});
 }
