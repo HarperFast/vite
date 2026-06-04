@@ -1,0 +1,7 @@
+# Coordinates production builds across Harper worker threads (and processes sharing a database) so the
+# app is built once per instance rather than once per worker. The plugin claims the per-app record with
+# status "building" before compiling; other workers see it and wait. See src/buildLock.ts.
+type ViteBuildInfo @table(database: "harperfast_vite", table: "vite_build_info") {
+	appName: String @primaryKey
+	status: String
+}

@@ -1,0 +1,8 @@
+# Caching example: a table whose records automatically expire after 60 seconds.
+# Combined with a Resource that populates on a cache miss, this is Harper's canonical
+# pattern for caching expensive work (e.g. server-rendered HTML or upstream API responses).
+type RenderCache @table(expiration: 60) @export {
+	path: ID @primaryKey
+	html: String
+	renderedAt: Date @createdTime
+}

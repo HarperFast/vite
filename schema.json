@@ -1,0 +1,45 @@
+{
+	"$schema": "http://json-schema.org/draft-07/schema#",
+	"title": "HarperDB Vite Plugin Configuration",
+	"type": "object",
+	"properties": {
+		"package": {
+			"type": "string",
+			"description": "The package name or path to the plugin's entry point."
+		},
+		"files": {
+			"oneOf": [
+				{
+					"type": "string",
+					"description": "A glob pattern string that specifies the files and directories to be handled by the plugin's default EntryHandler instance."
+				},
+				{
+					"type": "array",
+					"items": {
+						"type": "string"
+					},
+					"description": "An array of glob pattern strings that specifies the files and directories to be handled by the plugin's default EntryHandler instance."
+				},
+				{
+					"type": "object",
+					"description": "A FilesOptionObject that specifies the files and directories to be handled by the plugin's default EntryHandler instance.",
+					"additionalProperties": true
+				}
+			],
+			"description": "Specifies the files we should watch for changes to invoke re-building. This lets the user specify the files we should watch for changes to invoke re-building."
+		},
+		"ssr": {
+			"type": "string",
+			"description": "Path to the server-side render entry (relative to the application root, e.g. 'src/entry-server.tsx'). When set, the plugin renders HTML on the server: in development via Vite's ssrLoadModule, and in production from the built SSR bundle. Omit for a client-only (SPA) app."
+		},
+		"output": {
+			"type": "string",
+			"description": "The build output directory (relative to the application root) the plugin builds the client into. Defaults to 'dist'. Point Harper's `static` plugin at the same directory (e.g. files: 'dist/**') so it can serve the built output."
+		},
+		"hmr": {
+			"type": "boolean",
+			"description": "Whether to run the Vite dev server with hot module replacement (HMR). When omitted, defaults to Harper's dev mode (the DEV_MODE environment variable, set by `harper dev`). Set to true to force the dev server, or false to force the hybrid production build (build + recompile-on-change). Serving the built output is handled by Harper's `static` plugin, configured alongside this plugin."
+		}
+	},
+	"additionalProperties": true
+}

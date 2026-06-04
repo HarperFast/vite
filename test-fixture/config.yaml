@@ -1,0 +1,23 @@
+rest: true
+
+# GraphQL schema defines a TTL cache table (see schema.graphql) used for the caching example.
+graphqlSchema:
+  files: 'schema.graphql'
+
+# JavaScript resources, including a startup-precompute example (see resources.js).
+jsResource:
+  files: 'resources.js'
+
+# The Vite plugin builds the app (and, in SSR mode, renders the HTML). Listed before `static` so its
+# dev server takes precedence in `harper dev`. `output` is the build directory `static` serves below.
+'@harperfast/vite':
+  package: '@harperfast/vite'
+  files: 'src/**/*'
+  ssr: 'src/entry-server.tsx'
+  output: 'dist'
+
+# Harper's static plugin serves the built assets from the Vite output directory. `index: false` because
+# this is an SSR app — the Vite plugin renders `index.html`; static only serves assets.
+static:
+  files: 'dist/**'
+  index: false

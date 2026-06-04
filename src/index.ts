@@ -1,32 +1,26 @@
-import type { Scope } from 'harperdb';
-import { join } from 'node:path';
-import * as vite from 'vite';
-import { parentPort } from 'node:worker_threads';
+import type { Scope } from 'harper';
+import { normalizeSsrEntry, resolveHmr } from './options.ts';
+import { setupDevelopment } from './development.ts';
+import { setupProduction } from './production.ts';
+import { log } from './log.ts';
 
-export const viteWrapper = {
-	createServer: vite.createServer,
-};
+// Re-export the mockable wrappers so tests (and consumers) can reach them from the entry point.
+export { viteWrapper } from './wrappers.ts';
 
+/**
+ * Harper extension entry point. Runs the Vite dev server (HMR) or the hybrid-production build based on the
+ * `hmr` option (defaulting to Harper's `DEV_MODE`), then hands off to the matching setup. SSR is enabled
+ * when the `ssr` option points at a server entry.
+ */
 export async function handleApplication(scope: Scope) {
-	const componentPath = scope.directory;
+	const ssrEntry = normalizeSsrEntry(scope.options?.get?.(['ssr']));
+	const hmr = resolveHmr(scope.options?.get?.(['hmr']));
 
-	const viteInstance = await viteWrapper.createServer({
-		root: componentPath,
-		configFile: join(componentPath, 'vite.config.js'),
-		server: { middlewareMode: true },
-	});
+	log(scope, 'info', `handling '${scope.appName}' in ${hmr ? 'development (HMR)' : 'production'} mode`);
 
-	if (scope?.server?.http) {
-		scope.server.http(async (request: any) => viteInstance.middlewares(request._nodeRequest, request._nodeResponse));
+	if (hmr) {
+		await setupDevelopment(scope, ssrEntry);
+	} else {
+		await setupProduction(scope, ssrEntry);
 	}
-
-	scope.on('close', () => viteInstance.close());
-
-	// TODO: Once `scope.close` is emitting properly, we won't need this. Hopefully.
-	//       To you who read this in 2 years and shake your head: I salute you, sir or madam.
-	parentPort?.on('message', (msg) => {
-		if (msg.type === 'shutdown') {
-			viteInstance.close();
-		}
-	});
 }

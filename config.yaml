@@ -1,2 +1,7 @@
+# Build-coordination table (see schema.graphql). Loaded before the plugin module so the table
+# exists when the plugin runs.
+graphqlSchema:
+  files: 'schema.graphql'
+
 # Plugin entry point (required by Harper)
 pluginModule: 'dist/index.js'
