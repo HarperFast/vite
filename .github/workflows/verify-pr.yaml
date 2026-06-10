@@ -31,3 +31,31 @@ jobs:
         run: npm run format:check
       - name: Run unit tests
         run: npm run test:coverage
+
+  integration:
+    name: Integration (Node ${{ matrix.node-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # The integration runner (harper-integration-test-run) uses node:test run() options added in
+        # Node 22, so Node 20 is excluded here — the unit-test matrix above still covers the plugin on 20.
+        node-version: [22, 24]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Set up Node.js
+        uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238 # v6.2.0
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      # Builds the plugin, installs it into the fixture, then runs the suite against a real Harper instance.
+      # On Linux the loopback pool (127.0.0.0/8) and a canonical /tmp are available by default — no setup.
+      - name: Run integration tests
+        run: npm run test:integration

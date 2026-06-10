@@ -1,136 +1,119 @@
-import assert from 'node:assert';
-import { spawn } from 'node:child_process';
-import { readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { test } from 'node:test';
+/**
+ * Integration tests: the plugin running inside a real, ephemeral Harper instance.
+ *
+ * @harperfast/integration-testing owns the Harper lifecycle — it allocates a loopback address, creates a
+ * temporary install, copies the test-fixture in as a component, starts Harper, and tears it all down per
+ * suite. We just drive HTTP and assert behavior.
+ *
+ * Both modes run from the *same* fixture: the plugin picks the Vite dev server (HMR) vs. the hybrid
+ * production build from `DEV_MODE` (which `harper dev` sets), so the development suite starts Harper with
+ * `DEV_MODE=true` and the production suite without it.
+ */
+import { suite, test, before, after } from 'node:test';
+import { ok, strictEqual } from 'node:assert/strict';
+import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { homedir, platform } from 'node:os';
+import { basename, join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { setupHarperWithFixture, teardownHarper, type StartedHarperTestContext } from '@harperfast/integration-testing';
 
-const harperBin = join(import.meta.dirname, '..', 'node_modules', '.bin', 'harper');
+// On macOS the framework's default install dir lives under `tmpdir()` → `/var/folders/…`, where `/var` is a
+// symlink to `/private/var`. That mismatch breaks the plugin's production build (Vite realpaths the
+// `index.html` input → `/var` vs `/private/var` → an illegal relative chunk name) and makes the dev server
+// hang under the realpath form. A canonical dir under $HOME avoids it — and Harper's rootPath validation
+// forbids `.`, so the directory name has no dot. On Linux/CI `tmpdir()` is already canonical; leave it be.
+if (platform() === 'darwin') {
+	const parent = join(realpathSync(homedir()), 'harper-integration-test');
+	mkdirSync(parent, { recursive: true });
+	process.env.HARPER_INTEGRATION_TEST_INSTALL_PARENT_DIR ??= parent;
+}
+
 const fixtureDir = join(import.meta.dirname, '..', 'test-fixture');
 
-// Base install/admin env shared by both modes. `DEFAULTS_MODE` selects Harper's dev (HTTP, open) vs
-// prod (HTTPS, auth) install profile. The root path is passed as a CLI arg (`--ROOTPATH`) because that
-// is what Harper v5 uses to locate/create its config for a fresh, isolated install.
-const baseEnv = {
-	HDB_INSTALL: 'true',
-	TC_AGREEMENT: 'yes',
-	HDB_ADMIN_USERNAME: 'HDB_ADMIN',
-	HDB_ADMIN_PASSWORD: 'password',
-	OPERATIONSAPI_NETWORK_PORT: '9925',
-};
+// Harper's `exports` map blocks the framework's `require.resolve('harper/dist/bin/harper.js')`
+// auto-resolution, so point it at the CLI entry directly (the same script `node_modules/.bin/harper` runs).
+const harperBinPath = join(import.meta.dirname, '..', 'node_modules', 'harper', 'dist', 'bin', 'harper.js');
 
-// Browsers send `Accept: text/html` for navigations; the plugin (like Vite's SPA fallback) only
-// serves the HTML document for such requests, so non-browser clients still reach the Harper API.
+// `setupHarperWithFixture` copies the fixture into `<dataRootDir>/components/<basename>`; that copy — not
+// the repo's source tree — is what the running plugin builds from and what we edit to test rebuilds.
+const componentDir = (ctx: StartedHarperTestContext) =>
+	join(ctx.harper.dataRootDir, 'components', basename(fixtureDir));
+
+// Browsers send `Accept: text/html` for navigations; the plugin (like Vite's SPA fallback) only serves the
+// HTML document for such requests, so non-browser clients still reach the Harper API.
 const htmlHeaders = { Accept: 'text/html' };
 
-function startHarper(command: 'dev' | 'run', rootPath: string, defaultsMode: 'dev' | 'prod') {
-	rmSync(rootPath, { recursive: true, force: true });
-	const harper = spawn(harperBin, [command, '.', `--ROOTPATH=${rootPath}`], {
-		cwd: fixtureDir,
-		env: { ...process.env, ...baseEnv, DEFAULTS_MODE: defaultsMode },
-		stdio: ['pipe', 'pipe', 'pipe'],
-	});
-	harper.stdin.write('yes\n');
-	return harper;
-}
-
-// Harper runs a pool of worker threads; give it a moment to release port 9926 before the next test
-// starts another instance. Resolves once the process exits (or after a SIGKILL fallback).
-async function stopHarper(child: any): Promise<void> {
-	return new Promise((resolve) => {
-		const force = setTimeout(() => child.kill('SIGKILL'), 8000);
-		child.on('exit', () => {
-			clearTimeout(force);
-			setTimeout(resolve, 1000);
-		});
-		child.kill('SIGINT');
-	});
-}
-
-async function waitForOutput(child: any, pattern: string, timeout = 90000): Promise<void> {
-	return new Promise((resolve, reject) => {
-		const timer = setTimeout(() => reject(new Error(`Timeout waiting for pattern: ${pattern}`)), timeout);
-		child.stdout.on('data', (data: Buffer) => {
-			const str = data.toString();
-			process.stdout.write(str);
-			if (str.includes(pattern)) {
-				clearTimeout(timer);
-				resolve();
-			}
-		});
-		child.stderr.on('data', (data: Buffer) => process.stderr.write(data.toString()));
-	});
-}
-
-test('harper dev: server-renders with HMR over HTTP, and falls through to Harper resources', async () => {
-	// Requires a locally runnable Harper; skipped in restricted CI environments.
-	// Run `npm run test:integration` (which installs the local plugin into the fixture first).
-	if (process.env.SKIP_INTEGRATION) return;
-	const harper = startHarper('dev', '/tmp/hdb-vite-dev', 'dev');
-	try {
-		await waitForOutput(harper, 'successfully started');
-
-		// HTML navigation is server-rendered on the fly via Vite's ssrLoadModule.
-		const page = await fetch('http://localhost:9926/', { headers: htmlHeaders });
-		assert.strictEqual(page.status, 200);
-		const html = await page.text();
-		assert.ok(html.includes('Hello from Vite!'), 'page is server-rendered');
-		assert.ok(html.includes('/@vite/client'), 'Vite HMR client is present in dev');
-
-		// Requests the Vite app does not serve fall through to Harper resources (dev profile is open).
-		const api = await fetch('http://localhost:9926/Build', { headers: { Accept: 'application/json' } });
-		assert.strictEqual(api.status, 200, 'Harper resource reachable through fall-through');
-	} finally {
-		await stopHarper(harper);
+/** Poll the document until it contains `text` (or time out). The production build runs at startup — Harper
+ * reports "successfully started" before it finishes — so requests must wait for the first build to land. */
+async function waitForHtml(url: string, text: string, attempts = 60): Promise<string> {
+	for (let i = 0; i < attempts; i++) {
+		const html = await (await fetch(url, { headers: htmlHeaders })).text().catch(() => '');
+		if (html.includes(text)) return html;
+		await sleep(1000);
 	}
+	throw new Error(`timed out waiting for ${JSON.stringify(text)} at ${url}`);
+}
+
+suite('harper dev: server-renders with HMR over HTTP, and falls through to Harper resources', () => {
+	// `setupHarperWithFixture` populates `ctx.harper` in place; it's fully set by the time any test runs.
+	const ctx = {} as StartedHarperTestContext;
+	// `DEV_MODE=true` is what `harper dev` sets; it switches the plugin to the Vite dev server (HMR).
+	before(() => setupHarperWithFixture(ctx, fixtureDir, { harperBinPath, env: { DEV_MODE: 'true' } }));
+	after(() => teardownHarper(ctx));
+
+	test('HTML navigations are server-rendered, with the Vite HMR client injected', async () => {
+		// Harper auto-authorizes loopback requests as super_user, so the dev server's auth guard passes.
+		const page = await fetch(ctx.harper.httpURL, { headers: htmlHeaders });
+		strictEqual(page.status, 200);
+		const html = await page.text();
+		ok(html.includes('Hello from Vite!'), 'page is server-rendered');
+		ok(html.includes('/@vite/client'), 'Vite HMR client is present in dev');
+	});
+
+	test('requests the Vite app does not serve fall through to Harper resources', async () => {
+		const api = await fetch(`${ctx.harper.httpURL}/Build`, { headers: { Accept: 'application/json' } });
+		strictEqual(api.status, 200, 'Harper resource reachable through fall-through');
+	});
 });
 
-test('harper run: builds and server-renders the production output over HTTPS (no HMR)', async () => {
-	if (process.env.SKIP_INTEGRATION) return;
-	// Prod profile serves HTTPS with a self-signed cert; accept it for this local test.
-	const priorTlsSetting = process.env.NODE_TLS_REJECT_UNAUTHORIZED;
-	process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
-	const harper = startHarper('run', '/tmp/hdb-vite-prod', 'prod');
-	try {
-		await waitForOutput(harper, 'successfully started');
+suite('harper run: builds and server-renders the production output (no HMR)', () => {
+	const ctx = {} as StartedHarperTestContext;
+	before(async () => {
+		await setupHarperWithFixture(ctx, fixtureDir, { harperBinPath });
+		// Block until the startup build has produced the SSR render, so every test below sees a built app.
+		await waitForHtml(ctx.harper.httpURL, 'Hello from Vite!');
+	});
+	after(() => teardownHarper(ctx));
 
-		// Server-rendered from the built SSR bundle; no Vite dev client in production.
-		const page = await fetch('https://localhost:9926/', { headers: htmlHeaders });
-		assert.strictEqual(page.status, 200);
+	test('server-renders from the built SSR bundle, without the HMR client', async () => {
+		const page = await fetch(ctx.harper.httpURL, { headers: htmlHeaders });
+		strictEqual(page.status, 200);
 		const html = await page.text();
-		assert.ok(html.includes('Hello from Vite!'), 'page is server-rendered from the production build');
-		assert.ok(!html.includes('/@vite/client'), 'no HMR client in production');
-		assert.ok(!html.includes('<!--ssr-outlet-->'), 'the SSR outlet was rendered, not served raw');
+		ok(html.includes('Hello from Vite!'), 'page is server-rendered from the production build');
+		ok(!html.includes('/@vite/client'), 'no HMR client in production');
+		ok(!html.includes('<!--ssr-outlet-->'), 'the SSR outlet was rendered, not served raw');
+	});
 
-		// A hashed build asset is served by Harper's `static` plugin (configured alongside this plugin),
-		// which is the whole point of the parallel-static design.
+	test("a hashed build asset is served by Harper's static plugin", async () => {
+		// The whole point of the parallel-static design: the plugin renders HTML, `static` serves the assets.
+		const html = await (await fetch(ctx.harper.httpURL, { headers: htmlHeaders })).text();
 		const assetUrl = html.match(/\/assets\/[^"']+\.(?:js|css)/)?.[0];
-		assert.ok(assetUrl, 'rendered HTML references a built asset');
-		const asset = await fetch(`https://localhost:9926${assetUrl}`);
-		assert.strictEqual(asset.status, 200, 'the static plugin serves the built asset');
+		ok(assetUrl, 'rendered HTML references a built asset');
+		const asset = await fetch(`${ctx.harper.httpURL}${assetUrl}`);
+		strictEqual(asset.status, 200, 'the static plugin serves the built asset');
+	});
 
-		// The client build output exists (the `output` directory).
-		const { existsSync } = await import('node:fs');
-		assert.ok(existsSync(join(fixtureDir, 'dist')), 'client build output exists');
+	test('the client build output exists', () => {
+		ok(existsSync(join(componentDir(ctx), 'dist')), 'client build output exists');
+	});
 
-		// Rebuild-on-change: editing a watched source file recompiles and updates the served output.
-		const appFile = join(fixtureDir, 'src', 'App.tsx');
+	test('editing a watched source file triggers a rebuild that updates the served output', async () => {
+		// Edit the ephemeral component copy (teardown discards it) rather than the repo's source.
+		const appFile = join(componentDir(ctx), 'src', 'App.tsx');
 		const original = readFileSync(appFile, 'utf8');
-		try {
-			writeFileSync(appFile, original.replace('Hello from Vite!', 'Hello from Rebuild!'));
-			let rebuilt = false;
-			for (let i = 0; i < 45 && !rebuilt; i++) {
-				await sleep(1000);
-				const r = await fetch('https://localhost:9926/', { headers: htmlHeaders });
-				rebuilt = (await r.text()).includes('Hello from Rebuild!');
-			}
-			assert.ok(rebuilt, 'a source-file change triggers a rebuild that updates the served output');
-		} finally {
-			writeFileSync(appFile, original);
-		}
-	} finally {
-		await stopHarper(harper);
-		if (priorTlsSetting === undefined) delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
-		else process.env.NODE_TLS_REJECT_UNAUTHORIZED = priorTlsSetting;
-	}
+		writeFileSync(appFile, original.replace('Hello from Vite!', 'Hello from Rebuild!'));
+
+		// waitForHtml throws (failing the test) if the change never gets picked up.
+		await waitForHtml(ctx.harper.httpURL, 'Hello from Rebuild!');
+	});
 });
