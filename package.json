@@ -23,7 +23,7 @@
 		"email": "support@harperdb.io"
 	},
 	"scripts": {
-		"build": "rm -Rf dist && tsc",
+		"build": "tsc",
 		"dev": "tsc --watch",
 		"harper:dev": "harper dev .",
 		"test": "npm run build && node --test dist/index.test.js",
