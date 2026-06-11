@@ -56,21 +56,22 @@ function makeScope(
 /** Yield to the microtask/macrotask queue so async rebuilds settle. */
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 
-/** A minimal mock of a Node ServerResponse capturing what a handler writes. */
+/** A mock of a Node ServerResponse: captures what a handler writes and emits `finish` on `end`, like Node. */
 function mockResponse() {
-	return {
-		statusCode: 0,
-		headers: {} as Record<string, string>,
-		ended: false,
-		body: undefined as string | undefined,
-		setHeader(key: string, value: string) {
-			this.headers[key] = value;
-		},
-		end(body?: string) {
-			this.ended = true;
-			this.body = body;
-		},
+	const res = new EventEmitter() as any;
+	res.statusCode = 0;
+	res.headers = {} as Record<string, string>;
+	res.ended = false;
+	res.body = undefined as string | undefined;
+	res.setHeader = (key: string, value: string) => {
+		res.headers[key] = value;
 	};
+	res.end = (body?: string) => {
+		res.ended = true;
+		res.body = body;
+		res.emit('finish'); // Node emits `finish` once the response is fully written
+	};
+	return res;
 }
 
 /** A user object shaped like Harper's resolved super_user (the guard checks `role.permission.super_user`). */
@@ -140,6 +141,33 @@ describe('handleApplication — development mode', () => {
 		assert.strictEqual(middlewares.mock.callCount(), 1);
 		assert.strictEqual(nextLayer.mock.callCount(), 1, 'unhandled request falls through to Harper');
 		assert.strictEqual(result, 'HARPER_RESPONSE');
+		delete process.env.DEV_MODE;
+	});
+
+	it('resolves the handler when Vite handles the response, without falling through', { timeout: 5000 }, async (t) => {
+		process.env.DEV_MODE = 'true';
+		// Vite middleware that HANDLES the request: writes a response and never calls next() (assets, HMR).
+		const middlewares = t.mock.fn((_req: any, res: any) => {
+			res.statusCode = 200;
+			res.end('asset bytes');
+		});
+		t.mock.method(viteWrapper, 'createServer', async () => ({ close: t.mock.fn(), middlewares }));
+
+		const scope = makeScope({ withHttp: true });
+		await handleApplication(scope);
+
+		const res = mockResponse();
+		const request = { _nodeRequest: { method: 'GET', headers: {} }, _nodeResponse: res, user: SUPER_USER };
+		const nextLayer = t.mock.fn(() => 'HARPER_RESPONSE');
+
+		// Before the fix this never settled (Vite handles assets without calling next), leaking a pending
+		// promise per request. It now resolves once the response finishes, with `undefined` — Harper's
+		// "already handled via the node response" signal. The 5s timeout fails fast if that ever regresses.
+		const result = await scope.httpHandler(request, nextLayer);
+
+		assert.strictEqual(result, undefined, 'a handled response resolves the handler with undefined');
+		assert.strictEqual(res.ended, true, 'the middleware wrote and ended the response');
+		assert.strictEqual(nextLayer.mock.callCount(), 0, 'a handled request does not fall through to Harper');
 		delete process.env.DEV_MODE;
 	});
 
