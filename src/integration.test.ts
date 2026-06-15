@@ -16,7 +16,12 @@ import { homedir, platform } from 'node:os';
 import { basename, join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { setupHarperWithFixture, teardownHarper, type StartedHarperTestContext } from '@harperfast/integration-testing';
-import { HMR_PATH } from './development.ts';
+
+// The HMR WebSocket path — must match `HMR_PATH` in src/development.ts. Kept as a literal (NOT imported from
+// the plugin source) on purpose: this out-of-process driver must not pull the plugin's module graph — which
+// `import { databases } from 'harper'` and so eagerly loads Harper's internals — into the test runner's own
+// process, where it throws outside a configured Harper. If the two ever diverge, the WS test below fails loudly.
+const HMR_PATH = '/@harper-vite-hmr';
 
 // On macOS the framework's default install dir lives under `tmpdir()` → `/var/folders/…`, where `/var` is a
 // symlink to `/private/var`. That mismatch breaks the plugin's production build (Vite realpaths the
