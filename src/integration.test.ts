@@ -16,6 +16,7 @@ import { homedir, platform } from 'node:os';
 import { basename, join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { setupHarperWithFixture, teardownHarper, type StartedHarperTestContext } from '@harperfast/integration-testing';
+import { HMR_PATH } from './development.ts';
 
 // On macOS the framework's default install dir lives under `tmpdir()` → `/var/folders/…`, where `/var` is a
 // symlink to `/private/var`. That mismatch breaks the plugin's production build (Vite realpaths the
@@ -73,6 +74,27 @@ suite('harper dev: server-renders with HMR over HTTP, and falls through to Harpe
 	test('requests the Vite app does not serve fall through to Harper resources', async () => {
 		const api = await fetch(`${ctx.harper.httpURL}/Build`, { headers: { Accept: 'application/json' } });
 		strictEqual(api.status, 200, 'Harper resource reachable through fall-through');
+	});
+
+	test('the HMR WebSocket connects through Harper’s own port behind the auth gate', async () => {
+		// The HMR socket is served on Harper's port at the plugin's dedicated path — not Vite's default
+		// standalone port. Loopback is auto-authorized (authorizeLocal), so the plugin's upgrade gate forwards
+		// the upgrade to Vite, which completes the `vite-hmr` handshake. A successful open exercises the whole
+		// real chain end to end: Harper's upgrade routing → the super_user gate → the Vite bridge → handshake.
+		const wsURL = ctx.harper.httpURL.replace(/^http/, 'ws') + HMR_PATH;
+		const outcome = await new Promise<string>((resolve) => {
+			const ws = new WebSocket(wsURL, 'vite-hmr');
+			const done = (r: string) => {
+				try {
+					ws.close();
+				} catch {}
+				resolve(r);
+			};
+			ws.addEventListener('open', () => done('open'));
+			ws.addEventListener('error', () => done('error'));
+			setTimeout(() => done('timeout'), 10_000);
+		});
+		strictEqual(outcome, 'open', 'the gated HMR WebSocket upgrade is authorized and the handshake completes');
 	});
 });
 

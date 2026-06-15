@@ -117,13 +117,17 @@ In production the Harper process runs `vite build` at startup and — when [`fil
 
 If you prefer the traditional model, **build in CI and ship the output**: point `static` at the committed build directory and omit `files` so this plugin never compiles on the node (it stays idle while `static` serves the artifacts).
 
-### HMR / the dev server is gated behind super_user Basic auth
+### HMR / the dev server is gated behind super*user auth — HTTP \_and* WebSocket
 
-The Vite dev server (HMR mode) exposes powerful endpoints — on-the-fly module transforms and arbitrary file reads via `/@fs/` — and is not designed to face untrusted networks. This plugin therefore **requires Harper `super_user` credentials, via HTTP Basic auth, for the entire dev-server HTTP surface**:
+The Vite dev server (HMR mode) exposes powerful endpoints — on-the-fly module transforms and arbitrary file reads via `/@fs/` — and is not designed to face untrusted networks. This plugin therefore **requires Harper `super_user` credentials for the entire dev server: both its HTTP surface and its HMR WebSocket.** That gate is what lets you safely turn HMR on against a _deployed_ instance — e.g. from a cloud IDE — for a live-edit workflow when a local environment isn't an option.
 
 - **Local development is unaffected.** Harper auto-authorizes loopback requests as super_user under `authentication.authorizeLocal` (the default in `harper dev`), so `localhost` just works.
-- **Remote/exposed requests are challenged.** A request Harper did not authenticate as super_user receives a `401` with a `WWW-Authenticate: Basic` header; the browser then prompts for credentials, which are validated against Harper's user store. (This is why hitting the dev server from another device — e.g. a phone on the LAN — prompts for your admin login.)
-- **The HMR WebSocket is separate.** Vite pushes hot-update notifications over its own WebSocket on a different port, which is **not** routed through Harper and so is not covered by this gate. Keep it bound to localhost. As a rule, don't expose `harper dev` to the public internet — for anything internet-facing, run the production build (`hmr: false`).
+- **Remote/exposed HTTP requests are challenged.** A request Harper did not authenticate as super_user receives a `401` with a `WWW-Authenticate: Basic` header; the browser then prompts for credentials, which are validated against Harper's user store. (This is why hitting the dev server from another device — e.g. a phone on the LAN — prompts for your admin login.)
+- **The HMR WebSocket runs on Harper's port and is gated too.** Instead of Vite's default standalone WebSocket port, the plugin routes HMR over Harper's own port on a dedicated path and authorizes every upgrade as super_user — by trusting a loopback peer under `authorizeLocal` (so local `harper dev` needs no credentials, just like the HTTP surface), or, for a remote browser, by validating the `hdb-session` cookie Harper sets when you log in (or an `Authorization` header). So once the page has authenticated, the HMR socket connects under the same identity; an unauthenticated remote upgrade is refused and the socket closed. Nothing is exposed on a second port.
+- **Host checking is relaxed by design.** Because every request is already gated, the plugin sets Vite's `server.allowedHosts: true` so HMR also works when reached at a non-localhost hostname; the super_user gate — not Vite's host allowlist — is what protects the surface.
+- **Older Harper hosts fall back to a separate port.** If the host Harper is too old to expose the WebSocket `upgrade` hook this relies on, the plugin reverts to Vite's standalone WebSocket port, which is **not** gated (the plugin logs a warning). Keep it bound to localhost.
+
+As always, only grant `super_user` to people you trust, and prefer the production build (`hmr: false`) for anything that doesn't specifically need live editing.
 
 ### SSR renders before authentication
 

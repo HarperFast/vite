@@ -6,6 +6,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { handleApplication, viteWrapper } from './index.ts';
+import { HMR_PATH } from './development.ts';
 import { withBuildLock } from './buildLock.ts';
 
 // The build lock reads its coordination table from `databases` (imported from `harper`). These unit tests
@@ -23,12 +24,27 @@ function makeScope(
 		hmr?: unknown;
 		output?: unknown;
 		withHttp?: boolean;
+		// `withWebSocket` implies an HTTP server too, and additionally exposes Harper's `upgrade`/`ws`
+		// registration hooks plus `getUser` — the surface the HMR WebSocket gate uses.
+		withWebSocket?: boolean;
+		getUser?: (username: string, password: unknown, req: unknown) => unknown;
 	} = {}
-): Scope & { httpHandler?: any; httpHandlers: any[]; entry: EventEmitter } {
+): Scope & {
+	httpHandler?: any;
+	httpHandlers: any[];
+	entry: EventEmitter;
+	logs: Array<{ level: string; message: string }>;
+	upgradeHandler?: any;
+	upgradeOptions?: any;
+	wsHandler?: any;
+	wsOptions?: any;
+} {
 	const scope = new EventEmitter() as any;
 	scope.appName = 'test-app';
 	scope.directory = opts.directory ?? '/test/dir';
-	scope.logger = { error() {} };
+	scope.logs = [];
+	const capture = (level: string) => (message: string) => scope.logs.push({ level, message });
+	scope.logger = { error() {}, warn: capture('warn'), info: capture('info'), debug: capture('debug') };
 	scope.options = {
 		get(key: string[]) {
 			if (key[0] === 'ssr') return opts.ssr;
@@ -42,13 +58,25 @@ function makeScope(
 	scope.handleEntry = () => entry;
 	scope.entry = entry;
 	scope.httpHandlers = [];
-	if (opts.withHttp) {
-		scope.server = {
+	if (opts.withHttp || opts.withWebSocket) {
+		const server: any = {
 			http(handler: any) {
 				scope.httpHandlers.push(handler);
 				scope.httpHandler = handler; // most-recently registered, for convenience
 			},
 		};
+		if (opts.withWebSocket) {
+			server.upgrade = (handler: any, options: any) => {
+				scope.upgradeHandler = handler;
+				scope.upgradeOptions = options;
+			};
+			server.ws = (handler: any, options: any) => {
+				scope.wsHandler = handler;
+				scope.wsOptions = options;
+			};
+			if (opts.getUser) server.getUser = opts.getUser;
+		}
+		scope.server = server;
 	}
 	return scope;
 }
@@ -252,6 +280,202 @@ describe('handleApplication — development mode', () => {
 		await handleApplication(scope);
 
 		assert.strictEqual(createServerMock.mock.callCount(), 1, 'hmr: true forces the dev server');
+	});
+});
+
+describe('handleApplication — HMR WebSocket gating', () => {
+	// A raw upgrade request as Harper passes it on the upgrade chain (a Node IncomingMessage with url/headers/
+	// socket). The peer defaults to a non-loopback (public) address, i.e. a "remote" client; pass `ip` to test
+	// the loopback/authorizeLocal path.
+	const upgradeRequest = (headers: Record<string, string>, opts: { url?: string; ip?: string } = {}) => ({
+		url: opts.url ?? HMR_PATH,
+		headers,
+		socket: { remoteAddress: opts.ip ?? '203.0.113.5' },
+	});
+
+	/**
+	 * Stub Harper's `system.hdb_session` table for one test. `databases.system` is a read-only accessor, so we
+	 * redefine it (and restore it afterward) rather than assigning through it.
+	 */
+	function useSessionStore(t: any, getById: (id: string) => unknown) {
+		const original = Object.getOwnPropertyDescriptor(databases, 'system');
+		Object.defineProperty(databases, 'system', {
+			value: { hdb_session: { get: async (id: string) => getById(id) } },
+			configurable: true,
+		});
+		t.after(() => {
+			if (original) Object.defineProperty(databases, 'system', original);
+			else delete (databases as any).system;
+		});
+	}
+
+	/** A stand-in for the raw socket Harper hands the upgrade chain: captures writes and whether it's closed. */
+	function mockSocket() {
+		const socket = { written: [] as string[], destroyed: false } as any;
+		socket.write = (chunk: string) => (socket.written.push(chunk), true);
+		socket.destroy = () => {
+			socket.destroyed = true;
+		};
+		return socket;
+	}
+
+	/**
+	 * Boot the dev server with a WebSocket-capable scope. Returns the captured Vite config, the scope (with the
+	 * registered upgrade/ws handlers), and the HMR "bridge" server Vite was handed — with a spy attached to its
+	 * `upgrade` event so a test can assert that an authenticated upgrade was forwarded to Vite.
+	 */
+	async function bootDev(t: any, opts: Parameters<typeof makeScope>[0] = {}) {
+		process.env.DEV_MODE = 'true';
+		t.after(() => delete process.env.DEV_MODE);
+		let config: any;
+		t.mock.method(viteWrapper, 'createServer', async (c: any) => {
+			config = c;
+			return { close: t.mock.fn(), middlewares: t.mock.fn() };
+		});
+		const scope = makeScope({ withWebSocket: true, ...opts });
+		await handleApplication(scope);
+		const bridge = config.server.hmr.server;
+		const forwarded = t.mock.fn();
+		bridge.on('upgrade', forwarded);
+		return { config, scope, bridge, forwarded };
+	}
+
+	it('routes HMR through Harper on a gated path, allowing all hosts, when the upgrade hook exists', async (t) => {
+		const { config, scope } = await bootDev(t);
+
+		assert.strictEqual(config.server.middlewareMode, true);
+		assert.strictEqual(config.server.hmr.path, HMR_PATH, 'HMR is served on a dedicated path');
+		assert.ok(config.server.hmr.server, 'Vite attaches its WebSocket to the bridge, not a separate port');
+		assert.strictEqual(config.server.allowedHosts, true, 'Vite host allowlist is off (the auth gate covers it)');
+		assert.strictEqual(typeof scope.upgradeHandler, 'function', 'an upgrade gate is registered');
+		assert.strictEqual(scope.upgradeOptions?.runFirst, true, 'the gate runs ahead of Harper’s own upgrade handling');
+		assert.strictEqual(typeof scope.wsHandler, 'function', 'a ws handler is registered to wire the upgrade chain');
+	});
+
+	it('forwards an authenticated super_user upgrade (session cookie) to Vite', async (t) => {
+		useSessionStore(t, (id) => (id === 'sess-1' ? { user: 'admin' } : undefined));
+
+		const { scope, forwarded } = await bootDev(t, {
+			getUser: async (username) => (username === 'admin' ? SUPER_USER : undefined),
+		});
+
+		const socket = mockSocket();
+		const next = t.mock.fn();
+		await scope.upgradeHandler(upgradeRequest({ cookie: 'app_9926-hdb-session=sess-1' }), socket, undefined, next);
+
+		assert.strictEqual(forwarded.mock.callCount(), 1, 'the upgrade is handed to Vite');
+		assert.strictEqual(next.mock.callCount(), 0, 'a handled upgrade does not fall through to Harper');
+		assert.strictEqual(socket.destroyed, false, 'the socket is left open for the handshake');
+	});
+
+	it('forwards an authenticated super_user upgrade (Basic auth) to Vite', async (t) => {
+		const { scope, forwarded } = await bootDev(t);
+		(scope.server as any).authenticateUser = t.mock.fn(async (u: string) => (u === 'admin' ? SUPER_USER : undefined));
+
+		const authorization = 'Basic ' + Buffer.from('admin:secret').toString('base64');
+		const socket = mockSocket();
+		await scope.upgradeHandler(upgradeRequest({ authorization }), socket, undefined, t.mock.fn());
+
+		assert.strictEqual(forwarded.mock.callCount(), 1, 'a Basic-authenticated super_user reaches Vite');
+		assert.strictEqual(socket.destroyed, false);
+	});
+
+	it('refuses an unauthenticated upgrade with a 401 and closes the socket', async (t) => {
+		const { scope, forwarded } = await bootDev(t);
+
+		const socket = mockSocket();
+		const next = t.mock.fn();
+		await scope.upgradeHandler(upgradeRequest({}), socket, undefined, next);
+
+		assert.strictEqual(forwarded.mock.callCount(), 0, 'an unauthenticated upgrade never reaches Vite');
+		assert.match(socket.written.join(''), /401 Unauthorized/, 'a 401 is written to the socket');
+		assert.strictEqual(socket.destroyed, true, 'the socket is closed');
+		assert.strictEqual(next.mock.callCount(), 0, 'the request is handled (rejected), not passed on');
+	});
+
+	it('rejects a valid session that resolves to a non-super_user', async (t) => {
+		useSessionStore(t, () => ({ user: 'reader' }));
+
+		const { scope, forwarded } = await bootDev(t, {
+			getUser: async () => ({ role: { permission: { super_user: false } } }),
+		});
+
+		const socket = mockSocket();
+		await scope.upgradeHandler(upgradeRequest({ cookie: 'app-hdb-session=sess-1' }), socket, undefined, t.mock.fn());
+
+		assert.strictEqual(forwarded.mock.callCount(), 0, 'a non-super_user is refused');
+		assert.strictEqual(socket.destroyed, true);
+	});
+
+	it('authorizes a loopback upgrade under authorizeLocal (plain `harper dev`, no credentials)', async (t) => {
+		// bootDev runs with DEV_MODE=true, under which Harper trusts loopback for the HTTP surface; the gate
+		// mirrors that so the HMR socket connects on localhost with neither a Basic header nor a session cookie.
+		const { scope, forwarded } = await bootDev(t);
+
+		const socket = mockSocket();
+		await scope.upgradeHandler(upgradeRequest({}, { ip: '127.0.0.1' }), socket, undefined, t.mock.fn());
+
+		assert.strictEqual(forwarded.mock.callCount(), 1, 'a loopback upgrade is forwarded to Vite');
+		assert.strictEqual(socket.destroyed, false);
+	});
+
+	it('does not trust loopback when authorizeLocal is disabled', async (t) => {
+		const { scope, forwarded } = await bootDev(t);
+		process.env.AUTHENTICATION_AUTHORIZELOCAL = 'false';
+		t.after(() => delete process.env.AUTHENTICATION_AUTHORIZELOCAL);
+
+		const socket = mockSocket();
+		await scope.upgradeHandler(upgradeRequest({}, { ip: '127.0.0.1' }), socket, undefined, t.mock.fn());
+
+		assert.strictEqual(forwarded.mock.callCount(), 0, 'loopback alone is not trusted when authorizeLocal is off');
+		assert.strictEqual(socket.destroyed, true);
+	});
+
+	it('lets non-HMR upgrades fall through to Harper untouched', async (t) => {
+		const { scope, forwarded } = await bootDev(t);
+
+		const socket = mockSocket();
+		const next = t.mock.fn();
+		const request = upgradeRequest({}, { url: '/some/other/socket' });
+		await scope.upgradeHandler(request, socket, undefined, next);
+
+		assert.strictEqual(next.mock.callCount(), 1, 'a non-HMR upgrade is passed to the next handler');
+		assert.deepStrictEqual(next.mock.calls[0].arguments, [request, socket, undefined], 'forwarded unchanged');
+		assert.strictEqual(forwarded.mock.callCount(), 0);
+		assert.strictEqual(socket.destroyed, false, 'we do not touch upgrades we do not own');
+	});
+
+	it('registers a pass-through ws handler that forwards to the next handler', async (t) => {
+		const { scope } = await bootDev(t);
+
+		const next = t.mock.fn();
+		const ws = {},
+			request = {},
+			completion = Promise.resolve();
+		scope.wsHandler(ws, request, completion, next);
+
+		assert.strictEqual(next.mock.callCount(), 1, 'non-HMR ws connections are forwarded to rest/mqtt');
+		assert.deepStrictEqual(next.mock.calls[0].arguments, [ws, request, completion]);
+	});
+
+	it('falls back to a separate, ungated HMR port and warns when Harper has no upgrade hook', async (t) => {
+		process.env.DEV_MODE = 'true';
+		t.after(() => delete process.env.DEV_MODE);
+		let config: any;
+		t.mock.method(viteWrapper, 'createServer', async (c: any) => {
+			config = c;
+			return { close: t.mock.fn(), middlewares: t.mock.fn() };
+		});
+		// withHttp (not withWebSocket): the server exposes no `upgrade` hook.
+		const scope = makeScope({ withHttp: true });
+		await handleApplication(scope);
+
+		assert.strictEqual(config.server.hmr, true, 'falls back to Vite’s own HMR WebSocket on a separate port');
+		assert.strictEqual(scope.upgradeHandler, undefined, 'no upgrade gate is registered');
+		assert.ok(
+			scope.logs.some((l) => l.level === 'warn' && /separate, ungated port/.test(l.message)),
+			'warns that the HMR WebSocket is ungated'
+		);
 	});
 });
 
