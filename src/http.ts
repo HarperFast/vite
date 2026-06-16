@@ -75,22 +75,22 @@ export function registerHttp(scope: Scope, middleware: Middleware, options?: Rec
 
 /** Close the given instance both when the scope closes and when Harper broadcasts a shutdown message. */
 export function registerShutdown(scope: Scope, close: () => unknown): void {
-	// `scope`'s `close` event and a Harper `shutdown` message can both fire; close only once so we don't,
-	// e.g., call Vite's `server.close()` twice.
-	let closed = false;
-	const closeOnce = () => {
-		if (closed) return;
-		closed = true;
-		close();
-	};
+	// `scope`'s `close` event and a Harper `shutdown` message can both fire; run `close` exactly once and
+	// memoize its promise so every caller awaits the *same* teardown. Returning that promise from the
+	// `close` listener lets Harper's `scope.close()` await Vite's `server.close()` — i.e. wait for the
+	// rolldown dev-server runtime to be fully disposed before the worker exits. That ordering matters:
+	// tearing the worker down (exit or terminate) while rolldown's native runtime is still live crashes
+	// the whole process. The `shutdown` message starts the teardown as early as possible.
+	let closing: Promise<unknown> | undefined;
+	const closeOnce = () => (closing ??= (async () => close())());
 
 	const shutdownHandler = (msg: any) => {
-		if (msg?.type === 'shutdown') closeOnce();
+		if (msg?.type === 'shutdown') void closeOnce();
 	};
 
 	scope.on('close', () => {
-		closeOnce();
 		parentPort?.off('message', shutdownHandler);
+		return closeOnce();
 	});
 
 	parentPort?.on('message', shutdownHandler);
