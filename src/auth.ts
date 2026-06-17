@@ -14,10 +14,13 @@ export function isSuperUser(user: User | undefined): boolean {
  * A Connect middleware that restricts the chain behind it (the Vite dev server) to Harper `super_user`s,
  * authenticated via HTTP Basic auth. It runs the check itself against Harper's APIs:
  *
- * - `req.user` is the identity Harper's own auth layer already resolved for the request — including the
- *   super_user it auto-assigns to loopback requests under `authentication.authorizeLocal` (the default in
- *   `harper dev`). `registerHttp` bridges it onto the node request. So local development passes straight
- *   through with no prompt.
+ * - A super_user Harper already resolved (`req.user`, bridged onto the node request by `registerHttp` —
+ *   e.g. an authenticated admin) passes straight through.
+ * - A loopback peer under `authorizeLocal` (the default in `harper dev`) also passes, authorized here the
+ *   same way the HMR WebSocket gate does it (`isUpgradeAuthorized`): Harper applies `authorizeLocal` to
+ *   MQTT (and its Bun HTTP inject path) but NOT the Node HTTP middleware layer this runs in, so `req.user`
+ *   is unset for a plain loopback `harper dev` request — we trust the real socket peer ourselves rather
+ *   than relying on Harper to pre-set it. So local development passes straight through with no prompt.
  * - Otherwise we validate an `Authorization: Basic` header directly with `server.authenticateUser` and, on
  *   failure, reply `401` with a `WWW-Authenticate: Basic` header so a browser prompts for credentials.
  *
@@ -28,8 +31,10 @@ export function isSuperUser(user: User | undefined): boolean {
  */
 export function superUserAuth(scope: Scope, realm: string): Middleware {
 	return (req, res, next) => {
-		// Fast path: Harper already authenticated a super_user (any scheme, or local dev).
-		if (isSuperUser(req.user)) return next();
+		// Fast path: a super_user Harper already resolved (any scheme), or a loopback peer under
+		// authorizeLocal — authorized here the same way the HMR WebSocket gate is (see isUpgradeAuthorized),
+		// because Harper doesn't resolve authorizeLocal for the Node HTTP middleware layer this runs in.
+		if (isSuperUser(req.user) || authorizeLocalAllows(req)) return next();
 
 		authenticateBasic(scope, req)
 			.then((user) => {
