@@ -286,8 +286,6 @@ This package was previously published as `@harperfast/vite-plugin` (through `0.3
    });
    ```
 
-`@harperfast/vite-plugin` is deprecated and will receive no further updates.
-
 ## Tools Used
 
 1. [TypeScript](https://www.typescriptlang.org/) for static typing
