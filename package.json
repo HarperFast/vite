@@ -4,6 +4,9 @@
 	"description": "Plugin for running Vite applications inside Harper",
 	"license": "Apache-2.0",
 	"type": "module",
+	"publishConfig": {
+		"access": "public"
+	},
 	"files": [
 		"dist/**",
 		"!dist/**/*.test.*",
@@ -13,9 +16,9 @@
 		"LICENSE",
 		"README.md"
 	],
-	"homepage": "https://github.com/HarperFast/vite-plugin",
+	"homepage": "https://github.com/HarperFast/vite",
 	"bugs": {
-		"url": "https://github.com/HarperFast/vite-plugin/issues",
+		"url": "https://github.com/HarperFast/vite/issues",
 		"email": "support@harperdb.io"
 	},
 	"author": {
@@ -38,7 +41,7 @@
 	},
 	"repository": {
 		"type": "git",
-		"url": "https://github.com/HarperFast/vite-plugin"
+		"url": "https://github.com/HarperFast/vite"
 	},
 	"engines": {
 		"node": ">=22"

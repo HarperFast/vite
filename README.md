@@ -240,6 +240,54 @@ Avoid doing the same work on every request:
 
 See [`test-fixture/resources.js`](test-fixture/resources.js) and [`test-fixture/schema.graphql`](test-fixture/schema.graphql) for working examples.
 
+## Migrating from `@harperfast/vite-plugin`
+
+This package was previously published as `@harperfast/vite-plugin` (through `0.3.0-beta.9`). Starting with `1.0.0` it is `@harperfast/vite`. The plugin's own API and behavior are unchanged — steps 1–2 are the rename; steps 3–4 are a quick check that the rest of your setup is in the shape the plugin expects.
+
+1. Swap the dependency:
+
+   ```bash
+   npm uninstall @harperfast/vite-plugin
+   npm install @harperfast/vite --save-dev
+   ```
+
+2. Update `config.yaml` — both the component key and its `package`:
+
+   ```diff
+   -'@harperfast/vite-plugin':
+   -  package: '@harperfast/vite-plugin'
+   +'@harperfast/vite':
+   +  package: '@harperfast/vite'
+      files: 'src/**/*'
+      output: 'dist'
+   ```
+
+3. Make sure you have a `static` block. This plugin **builds** (and, in SSR mode, **renders** `index.html`); Harper's built-in `static` plugin **serves** the built assets. If you don't already have one, add it after the plugin block, pointed at the same directory as `output`:
+
+   ```yaml
+   static:
+     files: 'dist/**' # same directory as the plugin's `output`
+   ```
+
+   For an **SSR** app add `index: false` (the plugin renders `index.html`); for an **SPA** leave `index` on and optionally set `notFound: index.html` for client-side routing. See [Usage](#usage).
+
+4. Review your `vite.config.ts`. Nothing is strictly required — the plugin auto-resolves it and overrides Vite's build `outDir` with its `output` when it builds — but set `build.outDir` to the same directory so a standalone `vite build` stays consistent, alongside your framework plugin(s):
+
+   ```ts
+   import { defineConfig } from 'vite';
+   import react from '@vitejs/plugin-react'; // or your framework's Vite plugin
+
+   export default defineConfig({
+   	plugins: [react()],
+   	build: {
+   		outDir: 'dist', // match the plugin's `output`
+   		emptyOutDir: true,
+   	},
+   });
+   ```
+
+`@harperfast/vite-plugin` is deprecated and will receive no further updates.
+
 ## Tools Used
 
 1. [TypeScript](https://www.typescriptlang.org/) for static typing
