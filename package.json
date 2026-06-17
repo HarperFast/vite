@@ -66,10 +66,10 @@
 		"@semantic-release/release-notes-generator": "^14.1.0",
 		"@types/node": "^24.12.0",
 		"conventional-changelog-conventionalcommits": "^9.1.0",
-		"harper": "^5.0.25",
+		"harper": "^5.1.3",
 		"prettier": "^3.8.1",
 		"semantic-release": "^25.0.2",
 		"typescript": "^5.9.3",
-		"vite": "^8.0.0"
+		"vite": "^8.0.16"
 	}
 }
