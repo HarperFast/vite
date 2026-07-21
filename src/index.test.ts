@@ -772,9 +772,9 @@ describe('withBuildLock', () => {
 		assert.deepStrictEqual(table.puts, [], 'never writes a claim of its own — the other worker produced the output');
 	});
 
-	it('treats a stale "building" record as abandoned and builds anyway', async (t) => {
+	it('treats a "building" record with no recent heartbeat as abandoned and builds anyway', async (t) => {
 		const events: string[] = [];
-		// Older than the 5-minute stale threshold → the holder is assumed crashed.
+		// No heartbeat for longer than the stale threshold → the holder is assumed crashed.
 		const table = makeTable(events, [building(6 * 60 * 1000)]);
 		useTable(t, table);
 		const build = t.mock.fn(async () => {
@@ -799,5 +799,40 @@ describe('withBuildLock', () => {
 		await assert.rejects(withBuildLock(scope, build), /boom/);
 
 		assert.deepStrictEqual(events, ['put:building', 'build', 'put:idle'], 'the finally block releases the claim');
+	});
+
+	it('re-stamps the claim on a heartbeat while a long build runs, then releases it', async (t) => {
+		// Mock only setInterval — the heartbeat's timer. This path never reaches the waiter's sleep().
+		t.mock.timers.enable({ apis: ['setInterval'] });
+		const events: string[] = [];
+		const table = makeTable(events); // get → undefined (no existing record)
+		useTable(t, table);
+
+		let finishBuild!: () => void;
+		const build = t.mock.fn(() => new Promise<void>((resolve) => (finishBuild = resolve)));
+
+		const done = withBuildLock(scope, build);
+		await tick(); // claim the build, start the build, and arm the heartbeat
+		assert.deepStrictEqual(events, ['put:building'], 'claims once up front');
+
+		// Simulate a build long enough to cross two heartbeat intervals (30s each).
+		t.mock.timers.tick(30_000);
+		await tick();
+		t.mock.timers.tick(30_000);
+		await tick();
+		assert.deepStrictEqual(
+			events,
+			['put:building', 'put:building', 'put:building'],
+			'each heartbeat re-stamps the building claim so a live build never looks abandoned'
+		);
+
+		finishBuild();
+		await done;
+		assert.strictEqual(build.mock.callCount(), 1);
+		assert.strictEqual(
+			events.at(-1),
+			'put:idle',
+			'the terminal record is the last write — no heartbeat re-stamp after it'
+		);
 	});
 });
