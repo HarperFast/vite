@@ -5,23 +5,54 @@ import { log } from './log.ts';
 // Harper runs `handleApplication` in every worker thread, so without coordination each worker would run
 // its own `vite build` concurrently into the same output directory. We coordinate with a shared Harper
 // table (defined in schema.graphql): a worker claims the per-app record with status "building" before
-// compiling, and other workers see it and wait rather than building in parallel. This mirrors the
+// compiling, and other workers see it and wait rather than building in parallel. While building, the
+// claiming worker re-stamps the record on a heartbeat so a build of any length stays fresh; a crashed
+// builder's claim still goes stale (and is reclaimed) within STALE_MS. This mirrors the
 // `@harperfast/nextjs` build-info pattern and works across threads and processes that share the database.
 
 const DATABASE = 'harperfast_vite';
 const TABLE = 'vite_build_info';
-const STALE_MS = 5 * 60 * 1000; // a "building" record older than this is treated as abandoned (crashed build)
+// While building, the claiming worker re-stamps its "building" record on this interval so a live build
+// never looks abandoned, no matter how long it takes.
+const HEARTBEAT_MS = 30 * 1000;
+// A "building" record is treated as abandoned only once it has gone this long without a heartbeat — i.e.
+// the worker holding it crashed. This bounds crash detection; it does NOT need to exceed the build
+// duration, because the heartbeat keeps a live claim fresh. Must be comfortably larger than HEARTBEAT_MS
+// to tolerate the event loop being busy during a build.
+const STALE_MS = 2 * 60 * 1000;
 const POLL_MS = 150;
-const WAIT_TIMEOUT_MS = 5 * 60 * 1000;
 
 /** The build-info table, or undefined when running outside Harper (e.g. unit tests). */
 function buildInfoTable(): any {
 	return databases?.[DATABASE]?.[TABLE];
 }
 
-/** True while another worker holds a fresh "building" claim on this app. */
+/** True while another worker holds a fresh "building" claim on this app (heartbeat within STALE_MS). */
 function heldByOther(info: any): boolean {
 	return info?.status === 'building' && Date.now() - info.getUpdatedTime() < STALE_MS;
+}
+
+/**
+ * Re-stamp the "building" claim on an interval so a live (possibly long) build never looks abandoned to
+ * waiting workers. Returns a stop function that halts the heartbeat and awaits any in-flight re-stamp, so
+ * the caller can then write the terminal "idle" record as the last word on the claim.
+ */
+function startClaimHeartbeat(table: any, key: string, scope: Scope): () => Promise<void> {
+	let stopped = false;
+	let inFlight: Promise<unknown> = Promise.resolve();
+	const timer = setInterval(() => {
+		if (stopped) return;
+		inFlight = Promise.resolve(table.put(key, { status: 'building' })).catch((error: unknown) => {
+			log(scope, 'debug', 'build claim heartbeat failed', error);
+		});
+	}, HEARTBEAT_MS);
+	// Don't let the heartbeat timer keep the process alive on its own.
+	timer.unref?.();
+	return async () => {
+		stopped = true;
+		clearInterval(timer);
+		await inFlight;
+	};
 }
 
 /**
@@ -41,23 +72,30 @@ export async function withBuildLock(scope: Scope, build: () => Promise<void>): P
 
 	const key = scope.appName;
 
-	// If another worker is already building, wait for it to finish and then skip — it produced the output.
+	// If another worker is already building, wait for it. It heartbeats while building, so wait as long as
+	// the claim stays fresh — however long the build takes. Stop once it finishes ("idle" → its output is
+	// ready, so skip building) or its heartbeat lapses (crashed → fall through and rebuild below).
 	if (heldByOther(await table.get(key))) {
 		log(scope, 'debug', 'another worker is building; waiting for it to finish');
-		const start = Date.now();
-		while (Date.now() - start < WAIT_TIMEOUT_MS) {
+		while (true) {
 			await sleep(POLL_MS);
-			if (!heldByOther(await table.get(key))) return;
+			const info = await table.get(key);
+			if (heldByOther(info)) continue;
+			if (info?.status === 'idle') return;
+			break;
 		}
-		log(scope, 'warn', 'timed out waiting for another worker to finish building');
-		return;
 	}
 
-	// Claim the build. Other workers will observe "building" and wait above.
+	// Claim the build. Other workers will observe "building" and wait above; the heartbeat keeps the claim
+	// fresh for the duration of the build.
 	await table.put(key, { status: 'building' });
+	const stopHeartbeat = startClaimHeartbeat(table, key, scope);
 	try {
 		await build();
 	} finally {
+		// Stop the heartbeat before writing the terminal record so no stray re-stamp can revert it to
+		// "building" afterward.
+		await stopHeartbeat();
 		await table.put(key, { status: 'idle' });
 	}
 }
