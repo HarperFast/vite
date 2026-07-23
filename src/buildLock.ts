@@ -39,18 +39,33 @@ function heldByOther(info: any): boolean {
  */
 function startClaimHeartbeat(table: any, key: string, scope: Scope): () => Promise<void> {
 	let stopped = false;
+	let timer: any;
 	let inFlight: Promise<unknown> = Promise.resolve();
-	const timer = setInterval(() => {
+
+	// Recursive setTimeout (not setInterval) so the next beat is scheduled only after the current write
+	// settles — at most one re-stamp is ever in flight, so a slow write can't land after the terminal
+	// record and revert the claim. Chaining off Promise.resolve() also turns a synchronous throw from
+	// table.put into a caught rejection rather than an uncaught error in the timer callback.
+	const beat = () => {
 		if (stopped) return;
-		inFlight = Promise.resolve(table.put(key, { status: 'building' })).catch((error: unknown) => {
-			log(scope, 'debug', 'build claim heartbeat failed', error);
-		});
-	}, HEARTBEAT_MS);
+		inFlight = Promise.resolve()
+			.then(() => table.put(key, { status: 'building' }))
+			.catch((error: unknown) => log(scope, 'debug', 'build claim heartbeat failed', error))
+			.finally(() => {
+				if (!stopped) {
+					timer = setTimeout(beat, HEARTBEAT_MS);
+					timer.unref?.();
+				}
+			});
+	};
+
+	timer = setTimeout(beat, HEARTBEAT_MS);
 	// Don't let the heartbeat timer keep the process alive on its own.
 	timer.unref?.();
+
 	return async () => {
 		stopped = true;
-		clearInterval(timer);
+		clearTimeout(timer);
 		await inFlight;
 	};
 }
