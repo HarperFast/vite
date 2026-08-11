@@ -106,7 +106,7 @@ function mockResponse() {
 const SUPER_USER = { role: { permission: { super_user: true } } };
 
 describe('handleApplication — development mode', () => {
-	it('creates a Vite dev server with HMR and SPA app type when no ssr entry is configured', async (t) => {
+	it('creates a Vite dev server with HMR and the "custom" app type when no ssr entry is configured', async (t) => {
 		process.env.DEV_MODE = 'true';
 		const closeMock = t.mock.fn(async () => {});
 		const createServerMock = t.mock.method(viteWrapper, 'createServer', async () => ({
@@ -122,7 +122,9 @@ describe('handleApplication — development mode', () => {
 		assert.strictEqual(config?.root, '/test/dir');
 		assert.strictEqual(config?.server?.middlewareMode, true);
 		assert.strictEqual(config.server.hmr, true);
-		assert.strictEqual(config.appType, 'spa');
+		// Never 'spa': that makes Vite append its own 404 middleware, which would swallow every request
+		// bound for Harper. The plugin serves the SPA shell itself instead.
+		assert.strictEqual(config.appType, 'custom');
 		assert.strictEqual(config.configFile, undefined, 'configFile is omitted so Vite auto-resolves it');
 
 		scope.emit('close');
@@ -197,6 +199,118 @@ describe('handleApplication — development mode', () => {
 		assert.strictEqual(res.ended, true, 'the middleware wrote and ended the response');
 		assert.strictEqual(nextLayer.mock.callCount(), 0, 'a handled request does not fall through to Harper');
 		delete process.env.DEV_MODE;
+	});
+
+	it('hands WebSocket connections to Harper without running the middleware chain', async (t) => {
+		process.env.DEV_MODE = 'true';
+		const middlewares = t.mock.fn((_req: any, _res: any, next: any) => next());
+		t.mock.method(viteWrapper, 'createServer', async () => ({ close: t.mock.fn(), middlewares }));
+
+		const scope = makeScope({ withHttp: true });
+		await handleApplication(scope);
+
+		// Harper runs this same chain for WebSocket connections, with a Request built from the bare upgrade
+		// IncomingMessage: no `_nodeResponse`. Feeding that to Connect made Vite's CORS middleware throw
+		// `Cannot read properties of undefined (reading 'setHeader')`, which surfaced in the browser's HMR
+		// overlay and broke the handshake — so MQTT-over-WebSocket, subscriptions, etc. failed under `harper dev`.
+		const request = {
+			_nodeRequest: { method: 'GET', headers: { upgrade: 'websocket' }, url: '/mqtt' },
+			_nodeResponse: undefined,
+			isWebSocket: true,
+			user: SUPER_USER,
+		};
+		const nextLayer = t.mock.fn(() => 'HARPER_WS');
+		const result = await scope.httpHandler(request, nextLayer);
+
+		assert.strictEqual(middlewares.mock.callCount(), 0, 'Vite never sees a socket upgrade');
+		assert.strictEqual(nextLayer.mock.callCount(), 1, 'the connection is passed straight to Harper');
+		assert.strictEqual(result, 'HARPER_WS');
+		delete process.env.DEV_MODE;
+	});
+
+	/**
+	 * A dev server whose Vite middlewares serve nothing (always `next()`), rooted at a temp dir holding a
+	 * real `index.html` — so what reaches the client is decided entirely by the plugin's SPA fallback.
+	 */
+	function mockSpaDev(t: any) {
+		process.env.DEV_MODE = 'true';
+		const root = mkdtempSync(join(tmpdir(), 'vite-test-'));
+		t.after(() => {
+			rmSync(root, { recursive: true, force: true });
+			delete process.env.DEV_MODE;
+		});
+		writeFileSync(join(root, 'index.html'), '<html><body><div id="app"></div></body></html>');
+		const middlewares = t.mock.fn((_req: any, _res: any, next: any) => next());
+		t.mock.method(viteWrapper, 'createServer', async () => ({
+			close: t.mock.fn(),
+			middlewares,
+			transformIndexHtml: t.mock.fn(async (_url: string, html: string) => `${html}<!--transformed-->`),
+		}));
+		return { root, middlewares };
+	}
+
+	it('serves the transformed SPA shell for HTML navigations', async (t) => {
+		const { root } = mockSpaDev(t);
+		const scope = makeScope({ directory: root, withHttp: true });
+		await handleApplication(scope);
+
+		const res = mockResponse();
+		const request = {
+			_nodeRequest: { method: 'GET', headers: { accept: 'text/html' }, url: '/deep/link' },
+			_nodeResponse: res,
+			user: SUPER_USER,
+		};
+		const nextLayer = t.mock.fn(() => 'HARPER');
+		void scope.httpHandler(request, nextLayer);
+		for (let i = 0; i < 100 && !res.ended; i++) await tick();
+
+		assert.strictEqual(res.statusCode, 200);
+		assert.strictEqual(res.headers['Content-Type'], 'text/html');
+		assert.match(String(res.body), /<!--transformed-->$/, 'the shell goes through transformIndexHtml');
+		assert.strictEqual(nextLayer.mock.callCount(), 0, 'a navigation does not fall through');
+	});
+
+	it('falls through to Harper for API requests Vite does not serve', async (t) => {
+		const { root } = mockSpaDev(t);
+		const scope = makeScope({ directory: root, withHttp: true });
+		await handleApplication(scope);
+
+		// `fetch()` defaults to a wildcard Accept. Vite's own SPA fallback treats that as a navigation and
+		// answers with the HTML shell, so an app's JSON calls got HTML; and its 404 middleware ended
+		// everything else outright, so nothing reached Harper's REST layer at all. Both must fall through.
+		for (const accept of ['*/*', 'application/json']) {
+			const res = mockResponse();
+			const request = {
+				_nodeRequest: { method: 'GET', headers: { accept }, url: '/MatchState/demo' },
+				_nodeResponse: res,
+				user: SUPER_USER,
+			};
+			const nextLayer = t.mock.fn(() => 'HARPER_API');
+			const result = await scope.httpHandler(request, nextLayer);
+
+			assert.strictEqual(nextLayer.mock.callCount(), 1, `Accept: ${accept} reaches Harper`);
+			assert.strictEqual(result, 'HARPER_API');
+			assert.strictEqual(res.ended, false, `Accept: ${accept} is not answered by the dev server`);
+		}
+	});
+
+	it('falls through for navigations when the root has no index.html to serve', async (t) => {
+		const { root } = mockSpaDev(t);
+		rmSync(join(root, 'index.html'));
+		const scope = makeScope({ directory: root, withHttp: true });
+		await handleApplication(scope);
+
+		const res = mockResponse();
+		const request = {
+			_nodeRequest: { method: 'GET', headers: { accept: 'text/html' }, url: '/' },
+			_nodeResponse: res,
+			user: SUPER_USER,
+		};
+		const nextLayer = t.mock.fn(() => 'HARPER');
+		const result = await scope.httpHandler(request, nextLayer);
+
+		assert.strictEqual(result, 'HARPER', 'no shell to serve — Harper answers the navigation');
+		assert.strictEqual(res.ended, false);
 	});
 
 	it('rejects unauthenticated dev-server requests with a 401 Basic challenge', async (t) => {

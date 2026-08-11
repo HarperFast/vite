@@ -2,7 +2,7 @@ import type { Scope } from 'harper';
 import type { Server as HttpServer } from 'node:http';
 import { createServer as createBridgeServer } from 'node:http';
 import { join } from 'node:path';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { viteWrapper } from './wrappers.ts';
 import { acceptsHtml, chain, registerHttp, registerShutdown, type Middleware } from './http.ts';
 import { superUserAuth, isUpgradeAuthorized } from './auth.ts';
@@ -42,7 +42,9 @@ export async function setupDevelopment(scope: Scope, ssrEntry?: string) {
 			// dev is unchanged.
 			allowedHosts: true,
 		},
-		appType: ssrEntry ? 'custom' : 'spa',
+		// Always 'custom' — never 'spa'. Vite's own SPA handling is wrong for an app embedded in Harper on a
+		// shared URL space; `renderSpa` below replaces it. See that function for why.
+		appType: 'custom',
 	});
 
 	// The Vite dev server exposes powerful endpoints (on-the-fly module transforms, arbitrary file reads
@@ -53,7 +55,7 @@ export async function setupDevelopment(scope: Scope, ssrEntry?: string) {
 
 	const vite: Middleware = ssrEntry
 		? renderSsr(server, root, ssrEntry.startsWith('/') ? ssrEntry : `/${ssrEntry}`)
-		: (req, res, next) => server.middlewares(req, res, next);
+		: renderSpa(server, root);
 
 	registerHttp(scope, chain(authenticate, vite));
 
@@ -129,6 +131,46 @@ function refuseUpgrade(socket: any): void {
 		// The socket may already be gone.
 	}
 	socket.destroy?.();
+}
+
+/**
+ * SPA middleware: Vite serves assets and module transforms; HTML navigations get the transformed
+ * `index.html` shell; everything else falls through to Harper (the REST API, custom resources, …).
+ *
+ * We serve the shell ourselves instead of letting Vite do it via `appType: 'spa'`, because Vite's version
+ * of this assumes it owns the whole origin, and here it does not:
+ *
+ *   - Vite appends `vite404Middleware`, which *ends* every request it did not serve with a bare 404
+ *     instead of calling `next()`. Nothing downstream of the dev server would ever run, so every Harper
+ *     resource 404s for as long as HMR is on.
+ *   - Vite's HTML fallback claims any GET whose `Accept` includes the wildcard media range — which is
+ *     exactly what `fetch()` sends by default. An app's own API calls would silently receive the HTML
+ *     shell instead of JSON.
+ *
+ * `acceptsHtml` keeps the shell for genuine `text/html` document navigations only, which is also how the
+ * production SSR handler decides (see `setupProduction`), so dev and production agree on what a
+ * navigation is.
+ */
+function renderSpa(server: any, root: string): Middleware {
+	const templatePath = join(root, 'index.html');
+	return (req, res, next) => {
+		server.middlewares(req, res, async (err?: unknown) => {
+			if (err) return next(err);
+			// Not a navigation, or nothing to serve as a shell: let Harper have it.
+			if (!acceptsHtml(req) || !existsSync(templatePath)) return next();
+			try {
+				res.statusCode = 200;
+				res.setHeader('Content-Type', 'text/html');
+				res.setHeader('Cache-Control', 'no-cache');
+				// A HEAD asks only for headers; skip the transform entirely.
+				if ((req.method ?? 'GET') === 'HEAD') return res.end();
+				res.end(await server.transformIndexHtml(req.url, readFileSync(templatePath, 'utf-8')));
+			} catch (e) {
+				server.ssrFixStacktrace?.(e as Error);
+				next(e);
+			}
+		});
+	};
 }
 
 /**

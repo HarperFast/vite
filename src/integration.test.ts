@@ -11,8 +11,8 @@
  */
 import { suite, test, before, after } from 'node:test';
 import { ok, strictEqual } from 'node:assert/strict';
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
-import { homedir, platform } from 'node:os';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir, platform, tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { setupHarperWithFixture, teardownHarper, type StartedHarperTestContext } from '@harperfast/integration-testing';
@@ -28,10 +28,11 @@ const HMR_PATH = '/@harper-vite-hmr';
 // `index.html` input → `/var` vs `/private/var` → an illegal relative chunk name) and makes the dev server
 // hang under the realpath form. A canonical dir under $HOME avoids it — and Harper's rootPath validation
 // forbids `.`, so the directory name has no dot. On Linux/CI `tmpdir()` is already canonical; leave it be.
+const scratchParent =
+	platform() === 'darwin' ? join(realpathSync(homedir()), 'harper-integration-test') : realpathSync(tmpdir());
 if (platform() === 'darwin') {
-	const parent = join(realpathSync(homedir()), 'harper-integration-test');
-	mkdirSync(parent, { recursive: true });
-	process.env.HARPER_INTEGRATION_TEST_INSTALL_PARENT_DIR ??= parent;
+	mkdirSync(scratchParent, { recursive: true });
+	process.env.HARPER_INTEGRATION_TEST_INSTALL_PARENT_DIR ??= scratchParent;
 }
 
 const fixtureDir = join(import.meta.dirname, '..', 'test-fixture');
@@ -45,8 +46,8 @@ const harperBinPath = join(import.meta.dirname, '..', 'node_modules', 'harper', 
 const componentDir = (ctx: StartedHarperTestContext) =>
 	join(ctx.harper.dataRootDir, 'components', basename(fixtureDir));
 
-// Browsers send `Accept: text/html` for navigations; the plugin (like Vite's SPA fallback) only serves the
-// HTML document for such requests, so non-browser clients still reach the Harper API.
+// Browsers send `Accept: text/html` for navigations; the plugin serves the HTML document only for such
+// requests, so non-browser clients (and the app's own `fetch` calls) still reach the Harper API.
 const htmlHeaders = { Accept: 'text/html' };
 
 /** Poll the document until it contains `text` (or time out). The production build runs at startup — Harper
@@ -100,6 +101,62 @@ suite('harper dev: server-renders with HMR over HTTP, and falls through to Harpe
 			setTimeout(() => done('timeout'), 10_000);
 		});
 		strictEqual(outcome, 'open', 'the gated HMR WebSocket upgrade is authorized and the handshake completes');
+	});
+});
+
+/**
+ * Derive an SPA variant of the fixture — the same app, with `ssr` dropped from the component config — in a
+ * scratch directory. Harper v5's module loader realpath-checks every import against the application
+ * directory and rejects symlinks, so this has to be a physical copy, `node_modules` included.
+ */
+function makeSpaFixture(): string {
+	const dir = mkdtempSync(join(scratchParent, 'spa-fixture-'));
+	cpSync(fixtureDir, dir, { recursive: true });
+	const config = readFileSync(join(fixtureDir, 'config.yaml'), 'utf8').replace(/^[ \t]*ssr:.*\n/m, '');
+	writeFileSync(join(dir, 'config.yaml'), config);
+	return dir;
+}
+
+suite('harper dev (SPA): serves the app shell for navigations and falls through for everything else', () => {
+	const ctx = {} as StartedHarperTestContext;
+	let spaFixtureDir: string;
+	before(async () => {
+		spaFixtureDir = makeSpaFixture();
+		await setupHarperWithFixture(ctx, spaFixtureDir, { harperBinPath, env: { DEV_MODE: 'true' } });
+	});
+	after(async () => {
+		await teardownHarper(ctx);
+		rmSync(spaFixtureDir, { recursive: true, force: true });
+	});
+
+	test('HTML navigations get the app shell with the Vite HMR client injected', async () => {
+		const page = await fetch(ctx.harper.httpURL, { headers: htmlHeaders });
+		strictEqual(page.status, 200);
+		const html = await page.text();
+		ok(html.includes('<div id="app">'), 'the app shell is served');
+		ok(html.includes('/@vite/client'), 'the shell went through transformIndexHtml');
+	});
+
+	test('deep links get the shell too, so client-side routes survive a reload', async () => {
+		const page = await fetch(`${ctx.harper.httpURL}/some/client/route`, { headers: htmlHeaders });
+		strictEqual(page.status, 200);
+		ok((await page.text()).includes('/@vite/client'), 'an unknown path still gets the shell');
+	});
+
+	test('Harper resources stay reachable while the dev server is running', async () => {
+		// Regression guard: under `appType: 'spa'` Vite appends its own 404 middleware, which *ends* every
+		// request it did not serve instead of passing it on — so every Harper resource 404'd under `harper dev`.
+		const api = await fetch(`${ctx.harper.httpURL}/Build`, { headers: { Accept: 'application/json' } });
+		strictEqual(api.status, 200, 'a Harper resource is reachable through fall-through');
+	});
+
+	test('a wildcard Accept reaches the API instead of being answered with the shell', async () => {
+		// Regression guard: `fetch()` sends a wildcard Accept by default, and Vite's SPA fallback treats that
+		// as a navigation — so an app's own API calls silently received the HTML shell instead of JSON.
+		const api = await fetch(`${ctx.harper.httpURL}/Build`);
+		strictEqual(api.status, 200);
+		ok(api.headers.get('content-type')?.includes('json'), 'the API answered, not the HTML shell');
+		strictEqual(typeof (await api.json()).answer, 'number');
 	});
 });
 
