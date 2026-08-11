@@ -34,43 +34,50 @@ export function acceptsHtml(req: any): boolean {
  * does not handle, falls through to the next Harper layer (e.g. `rest: true` resources) via `nextLayer`.
  */
 export function registerHttp(scope: Scope, middleware: Middleware, options?: Record<string, unknown>): void {
-	scope.server?.http?.(
-		(request: any, nextLayer: (request: any) => unknown) =>
-			new Promise((resolve, reject) => {
-				const res = request._nodeResponse;
+	scope.server?.http?.((request: any, nextLayer: (request: any) => unknown) => {
+		// Harper runs the HTTP handler chain for WebSocket connections too, building the Request from the
+		// bare upgrade `IncomingMessage` — so it carries no `_nodeResponse` (and the Bun/uWS request adapters
+		// have neither node object). A Connect middleware needs both: Vite's CORS middleware is the first in
+		// its stack and calls `res.setHeader()` unconditionally, throwing `Cannot read properties of undefined
+		// (reading 'setHeader')` — which Vite's error middleware then broadcasts to the browser's HMR overlay,
+		// while the rejected chain also breaks the WebSocket handshake itself. There is nothing for a
+		// middleware to do with a socket upgrade anyway, so hand it straight to Harper.
+		if (!request._nodeRequest || !request._nodeResponse) return nextLayer(request);
 
-				// A middleware that handles the request writes the response directly and never calls `next`.
-				// Resolve once the response completes so Harper's awaited handler doesn't accumulate a pending
-				// promise (and its captured req/res) per handled request — a leak under load. Resolving
-				// `undefined` is exactly the "already handled via the node response" signal Harper looks for,
-				// so it won't double-send; the fall-through path below resolves with the next layer instead.
-				const onComplete = () => {
-					cleanup();
-					resolve(undefined);
-				};
-				const cleanup = () => {
-					res?.removeListener?.('finish', onComplete);
-					res?.removeListener?.('close', onComplete);
-				};
-				res?.on?.('finish', onComplete);
-				res?.on?.('close', onComplete);
+		return new Promise((resolve, reject) => {
+			const res = request._nodeResponse;
 
-				// Bridge Harper's resolved identity onto the node request so a node-level middleware can run
-				// its own auth check (e.g. the dev server's super_user gate). Harper itself does this for
-				// fall-through requests (`request._nodeRequest.user = request.user`); we do it up front.
-				request._nodeRequest.user = request.user;
-				middleware(request._nodeRequest, res, (err?: unknown) => {
-					cleanup();
-					if (err) return reject(err);
-					try {
-						resolve(nextLayer(request));
-					} catch (e) {
-						reject(e);
-					}
-				});
-			}),
-		options
-	);
+			// A middleware that handles the request writes the response directly and never calls `next`.
+			// Resolve once the response completes so Harper's awaited handler doesn't accumulate a pending
+			// promise (and its captured req/res) per handled request — a leak under load. Resolving
+			// `undefined` is exactly the "already handled via the node response" signal Harper looks for,
+			// so it won't double-send; the fall-through path below resolves with the next layer instead.
+			const onComplete = () => {
+				cleanup();
+				resolve(undefined);
+			};
+			const cleanup = () => {
+				res?.removeListener?.('finish', onComplete);
+				res?.removeListener?.('close', onComplete);
+			};
+			res?.on?.('finish', onComplete);
+			res?.on?.('close', onComplete);
+
+			// Bridge Harper's resolved identity onto the node request so a node-level middleware can run
+			// its own auth check (e.g. the dev server's super_user gate). Harper itself does this for
+			// fall-through requests (`request._nodeRequest.user = request.user`); we do it up front.
+			request._nodeRequest.user = request.user;
+			middleware(request._nodeRequest, res, (err?: unknown) => {
+				cleanup();
+				if (err) return reject(err);
+				try {
+					resolve(nextLayer(request));
+				} catch (e) {
+					reject(e);
+				}
+			});
+		});
+	}, options);
 }
 
 /** Close the given instance both when the scope closes and when Harper broadcasts a shutdown message. */
