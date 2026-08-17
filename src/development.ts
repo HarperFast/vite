@@ -16,8 +16,10 @@ export const HMR_PATH = '/@harper-vite-hmr';
 
 /**
  * Development mode: a Vite dev server in middleware mode with HMR.
- * - SPA: Vite serves `index.html` and assets; everything else falls through to Harper.
+ * - SPA: Vite serves assets; HTML navigations get the transformed `index.html` shell (see `renderSpa`).
  * - SSR: Vite serves assets; HTML navigations are rendered on the fly via `ssrLoadModule`.
+ *
+ * Either way, anything the dev server does not serve falls through to Harper.
  */
 export async function setupDevelopment(scope: Scope, ssrEntry?: string) {
 	const root = scope.directory;
@@ -150,6 +152,9 @@ function refuseUpgrade(socket: any): void {
  * `acceptsHtml` keeps the shell for genuine `text/html` document navigations only, which is also how the
  * production SSR handler decides (see `setupProduction`), so dev and production agree on what a
  * navigation is.
+ *
+ * This assumes the single `index.html` entry an SPA has: every navigation gets that shell, so a project
+ * with a second HTML entry point would need Vite's multi-page handling instead.
  */
 function renderSpa(server: any, root: string): Middleware {
 	const templatePath = join(root, 'index.html');
@@ -159,12 +164,14 @@ function renderSpa(server: any, root: string): Middleware {
 			// Not a navigation, or nothing to serve as a shell: let Harper have it.
 			if (!acceptsHtml(req) || !existsSync(templatePath)) return next();
 			try {
+				// Transform first, then write: a failure here must not leave a half-set `text/html` 200 on a
+				// response the error handler is about to turn into a 500. Same order as `renderSsr` below.
+				const html = await server.transformIndexHtml(req.url, readFileSync(templatePath, 'utf-8'));
 				res.statusCode = 200;
 				res.setHeader('Content-Type', 'text/html');
 				res.setHeader('Cache-Control', 'no-cache');
-				// A HEAD asks only for headers; skip the transform entirely.
-				if ((req.method ?? 'GET') === 'HEAD') return res.end();
-				res.end(await server.transformIndexHtml(req.url, readFileSync(templatePath, 'utf-8')));
+				// Node clears `_hasBody` for a HEAD request, so this sends the headers and no body.
+				res.end(html);
 			} catch (e) {
 				server.ssrFixStacktrace?.(e as Error);
 				next(e);
