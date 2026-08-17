@@ -212,7 +212,8 @@ describe('handleApplication — development mode', () => {
 		// Harper runs this same chain for WebSocket connections, with a Request built from the bare upgrade
 		// IncomingMessage: no `_nodeResponse`. Feeding that to Connect made Vite's CORS middleware throw
 		// `Cannot read properties of undefined (reading 'setHeader')`, which surfaced in the browser's HMR
-		// overlay and broke the handshake — so MQTT-over-WebSocket, subscriptions, etc. failed under `harper dev`.
+		// overlay on every app WebSocket (MQTT-over-WebSocket, subscriptions, …) under `harper dev` — and,
+		// once the 401 challenge wrote to the missing `res`, rejected the chain and killed the connection.
 		const request = {
 			_nodeRequest: { method: 'GET', headers: { upgrade: 'websocket' }, url: '/mqtt' },
 			_nodeResponse: undefined,
@@ -275,9 +276,12 @@ describe('handleApplication — development mode', () => {
 		const scope = makeScope({ directory: root, withHttp: true });
 		await handleApplication(scope);
 
-		// `fetch()` defaults to a wildcard Accept. Vite's own SPA fallback treats that as a navigation and
-		// answers with the HTML shell, so an app's JSON calls got HTML; and its 404 middleware ended
-		// everything else outright, so nothing reached Harper's REST layer at all. Both must fall through.
+		// `fetch()` defaults to a wildcard Accept, which Vite's own SPA fallback treats as a navigation — so
+		// an app's JSON calls came back as the HTML shell. Neither Accept may be answered here.
+		//
+		// This pins down our own `acceptsHtml` gate only: the mocked `middlewares` always calls `next()`, so
+		// it cannot model Vite's 404 middleware ending the request. The `harper dev (SPA)` integration suite
+		// is what covers that half against a real Vite.
 		for (const accept of ['*/*', 'application/json']) {
 			const res = mockResponse();
 			const request = {

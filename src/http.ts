@@ -39,9 +39,10 @@ export function registerHttp(scope: Scope, middleware: Middleware, options?: Rec
 		// bare upgrade `IncomingMessage` — so it carries no `_nodeResponse` (and the Bun/uWS request adapters
 		// have neither node object). A Connect middleware needs both: Vite's CORS middleware is the first in
 		// its stack and calls `res.setHeader()` unconditionally, throwing `Cannot read properties of undefined
-		// (reading 'setHeader')` — which Vite's error middleware then broadcasts to the browser's HMR overlay,
-		// while the rejected chain also breaks the WebSocket handshake itself. There is nothing for a
-		// middleware to do with a socket upgrade anyway, so hand it straight to Harper.
+		// (reading 'setHeader')`, which Vite broadcasts to the browser's HMR overlay — so every app WebSocket
+		// (MQTT-over-WebSocket, Harper subscriptions, …) raised an overlay for as long as HMR was on. An
+		// upgrade from a peer that isn't a loopback super_user died outright too: our 401 challenge writes to
+		// that same missing `res`, rejecting the chain. Nothing here needs a middleware, so hand it to Harper.
 		if (!request._nodeRequest || !request._nodeResponse) return nextLayer(request);
 
 		return new Promise((resolve, reject) => {
