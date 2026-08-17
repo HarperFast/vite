@@ -35,14 +35,12 @@ export function acceptsHtml(req: any): boolean {
  */
 export function registerHttp(scope: Scope, middleware: Middleware, options?: Record<string, unknown>): void {
 	scope.server?.http?.((request: any, nextLayer: (request: any) => unknown) => {
-		// Harper runs the HTTP handler chain for WebSocket connections too, building the Request from the
-		// bare upgrade `IncomingMessage` — so it carries no `_nodeResponse` (and the Bun/uWS request adapters
-		// have neither node object). A Connect middleware needs both: Vite's CORS middleware is the first in
-		// its stack and calls `res.setHeader()` unconditionally, throwing `Cannot read properties of undefined
-		// (reading 'setHeader')`, which Vite broadcasts to the browser's HMR overlay — so every app WebSocket
-		// (MQTT-over-WebSocket, Harper subscriptions, …) raised an overlay for as long as HMR was on. An
-		// upgrade from a peer that isn't a loopback super_user died outright too: our 401 challenge writes to
-		// that same missing `res`, rejecting the chain. Nothing here needs a middleware, so hand it to Harper.
+		// Harper runs this chain for WebSocket connections too, building the Request from the bare upgrade
+		// `IncomingMessage`, which carries no `_nodeResponse` (the Bun/uWS adapters have neither node object).
+		// A Connect middleware needs both — Vite's CORS middleware sets response headers unconditionally, and
+		// our own 401 challenge writes to `res` — so a socket upgrade must never enter the chain. There is
+		// nothing for a middleware to do with one anyway. Gating the HMR socket is `gateHmrWebSocket`'s job,
+		// on the upgrade chain; an app's own WebSockets are Harper's surface, authenticated by Harper.
 		if (!request._nodeRequest || !request._nodeResponse) return nextLayer(request);
 
 		return new Promise((resolve, reject) => {
