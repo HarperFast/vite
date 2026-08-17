@@ -209,11 +209,8 @@ describe('handleApplication — development mode', () => {
 		const scope = makeScope({ withHttp: true });
 		await handleApplication(scope);
 
-		// Harper runs this same chain for WebSocket connections, with a Request built from the bare upgrade
-		// IncomingMessage: no `_nodeResponse`. Feeding that to Connect made Vite's CORS middleware throw
-		// `Cannot read properties of undefined (reading 'setHeader')`, which surfaced in the browser's HMR
-		// overlay on every app WebSocket (MQTT-over-WebSocket, subscriptions, …) under `harper dev` — and,
-		// once the 401 challenge wrote to the missing `res`, rejected the chain and killed the connection.
+		// The shape Harper hands the chain for a WebSocket connection: a Request built from the bare upgrade
+		// IncomingMessage, so `_nodeResponse` is missing. It has to reach Harper without entering Connect.
 		const request = {
 			_nodeRequest: { method: 'GET', headers: { upgrade: 'websocket' }, url: '/mqtt' },
 			_nodeResponse: undefined,
@@ -233,7 +230,7 @@ describe('handleApplication — development mode', () => {
 	 * A dev server whose Vite middlewares serve nothing (always `next()`), rooted at a temp dir holding a
 	 * real `index.html` — so what reaches the client is decided entirely by the plugin's SPA fallback.
 	 */
-	function mockSpaDev(t: any) {
+	function mockSpaDev(t: any, transformIndexHtml?: (url: string, html: string) => Promise<string>) {
 		process.env.DEV_MODE = 'true';
 		const root = mkdtempSync(join(tmpdir(), 'vite-test-'));
 		t.after(() => {
@@ -245,7 +242,9 @@ describe('handleApplication — development mode', () => {
 		t.mock.method(viteWrapper, 'createServer', async () => ({
 			close: t.mock.fn(),
 			middlewares,
-			transformIndexHtml: t.mock.fn(async (_url: string, html: string) => `${html}<!--transformed-->`),
+			transformIndexHtml: t.mock.fn(
+				transformIndexHtml ?? (async (_url: string, html: string) => `${html}<!--transformed-->`)
+			),
 		}));
 		return { root, middlewares };
 	}
@@ -271,17 +270,41 @@ describe('handleApplication — development mode', () => {
 		assert.strictEqual(nextLayer.mock.callCount(), 0, 'a navigation does not fall through');
 	});
 
+	it('leaves the response untouched when the HTML transform fails', async (t) => {
+		// The status and headers must be written only after the transform resolves. Setting them first left a
+		// `200 text/html` on the response that the error handler then turned into a 500 still labelled HTML.
+		const { root } = mockSpaDev(t, async () => {
+			throw new Error('transform exploded');
+		});
+		const scope = makeScope({ directory: root, withHttp: true });
+		await handleApplication(scope);
+
+		const res = mockResponse();
+		const request = {
+			_nodeRequest: { method: 'GET', headers: { accept: 'text/html' }, url: '/', user: SUPER_USER },
+			_nodeResponse: res,
+			user: SUPER_USER,
+		};
+		await assert.rejects(
+			scope.httpHandler(request, t.mock.fn()),
+			/transform exploded/,
+			'the failure propagates so Harper can answer with its own error'
+		);
+		assert.strictEqual(res.ended, false, 'nothing was sent');
+		assert.strictEqual(res.statusCode, 0, 'no status was set');
+		assert.deepStrictEqual(res.headers, {}, 'no Content-Type was left behind for the 500 to inherit');
+	});
+
 	it('falls through to Harper for API requests Vite does not serve', async (t) => {
 		const { root } = mockSpaDev(t);
 		const scope = makeScope({ directory: root, withHttp: true });
 		await handleApplication(scope);
 
-		// `fetch()` defaults to a wildcard Accept, which Vite's own SPA fallback treats as a navigation — so
-		// an app's JSON calls came back as the HTML shell. Neither Accept may be answered here.
+		// `fetch()` defaults to a wildcard Accept, which Vite's own SPA fallback treats as a navigation.
+		// Neither Accept may be answered here.
 		//
-		// This pins down our own `acceptsHtml` gate only: the mocked `middlewares` always calls `next()`, so
-		// it cannot model Vite's 404 middleware ending the request. The `harper dev (SPA)` integration suite
-		// is what covers that half against a real Vite.
+		// Scope: the mocked `middlewares` always calls `next()`, so this covers the `acceptsHtml` gate only,
+		// not Vite's 404 middleware — the `harper dev (SPA)` integration suite covers that.
 		for (const accept of ['*/*', 'application/json']) {
 			const res = mockResponse();
 			const request = {
