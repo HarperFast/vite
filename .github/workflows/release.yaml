@@ -46,7 +46,7 @@ jobs:
         run: npm run test:coverage
       - name: Semantic Release
         if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event_name == 'merge_group' && github.event.merge_group.base_ref == 'refs/heads/main') }}
-        uses: cycjimmy/semantic-release-action@1989a0fefc4aea321e07f717680ed8e345925dc1 # v7.1.2
+        uses: cycjimmy/semantic-release-action@d9bf53a078bd2f86aaffaec796dbb3d28f1b6f34 # v8.1.3
         with:
           extra_plugins: |
             @semantic-release/commit-analyzer
